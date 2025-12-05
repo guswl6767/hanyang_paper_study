@@ -27,7 +27,7 @@ services:
       memlock: -1
       stack: 67108864
     ports:
-      - "8099:8099"          # 필요 포트 매핑
+      - "8098:8098"          # 필요 포트 매핑
     tty: true                # 터미널 유지
     restart: always
     privileged: true         # (웹캠 등 디바이스 필요 시)

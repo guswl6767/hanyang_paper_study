@@ -6,7 +6,7 @@ from torch.optim import Adam
 from tqdm import tqdm
 from configs import DATASETS, TimeGradPaperCfg
 from data import load_multivariate, scale_by_context_mean
-from model_timegrad import TimeGrad
+from model_timegrad_2 import TimeGrad
 
 def seed_all(s=42):
     import random, numpy as np, torch
@@ -18,8 +18,10 @@ def main():
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--save_dir", type=str, default=None)
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--seed", type=int, default=2025)
+
     args = parser.parse_args()
-    seed_all(2025)
+    seed_all(args.seed)
 
     ds_name = args.dataset
     freq, pred_len = DATASETS[ds_name]
@@ -66,7 +68,26 @@ def main():
             losses.append(loss.item())
 
         print(f"[{ds_name}] Epoch {epoch:03d} | loss={np.mean(losses):.6f}")
-        torch.save({"model": model.state_dict(), "D": D, "cfg": cfg.__dict__}, ckpt)
+        # torch.save({"model": model.state_dict(), "D": D, "cfg": cfg.__dict__}, ckpt)
+        # ★ CPU로 저장 + 메타 기록
+        cpu_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+        train_cfg = {
+            "dataset": ds_name,
+            "seed": args.seed,
+            "epochs": args.epochs,
+            "lr": TimeGradPaperCfg().lr,
+            "batch_size": TimeGradPaperCfg().batch_size,
+            "optimizer": "Adam",
+            "context_len": context_len,
+            "pred_len": pred_len,
+        }
+        torch.save({
+            "model": cpu_state,
+            "D": D,
+            "cfg": TimeGradPaperCfg().__dict__,  # 이미 저장하던 cfg
+            "train_cfg": train_cfg,              # ★ 학습 하이퍼 기록
+            "role": "teacher"                    # ★ 역할 표기
+        }, ckpt)
 
     print("Teacher saved:", ckpt)
 

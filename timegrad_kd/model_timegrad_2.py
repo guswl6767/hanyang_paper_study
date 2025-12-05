@@ -46,8 +46,19 @@ class TimeGrad(nn.Module):
         x_n = self.sched.sample_noisy(x0_t, n_idx, eps)
 
         n_emb = self.noise_emb(n_idx)   # (B,E)
-        eps_hat = self.eps_net(x_n, h_prev, n_emb)
-        loss = F.mse_loss(eps_hat, eps)
+        # eps_hat = self.eps_net(x_n, h_prev, n_emb)
+        # loss = F.mse_loss(eps_hat, eps)
+        eps_hat = self.eps_net(x_n, h_prev, n_emb)     
+        raw_mse = F.mse_loss(eps_hat, eps)  # 순수 MSE    # (B,D)
+        a_bar = self.sched.alpha_bar[n_idx-1].view(-1,1)   # (B,1)
+        snr = a_bar / (1 - a_bar + 1e-8)                   # (B,1)
+        w = snr.pow(0.5)                                   # gamma=0.5
+        loss = (w * (eps_hat - eps).pow(2)).mean()
+        # 디버그용 로그 저장 (모델 속성에)
+        self._last_losses = {
+            "raw_mse": float(raw_mse.detach().item()),
+            "weighted": float(loss.detach().item()),
+        }
         return loss
 
     # ----- forecast sampling (Algorithm 2) -----

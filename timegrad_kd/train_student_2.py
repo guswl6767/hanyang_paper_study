@@ -7,6 +7,7 @@ from configs import DATASETS
 from data import load_multivariate, scale_by_context_mean
 from model_timegrad import TimeGrad
 from kd_losses import score_matching_kd, one_step_update_kd
+import torch.nn.functional as F   # ★ KD/손실 계산에 필요
 
 # train_student.py top 근처
 DATASET_STU_CFG = {
@@ -88,12 +89,19 @@ def main():
                     beta_start=1e-4, beta_end=1e-1).to(args.device)
 
     opt = Adam(student.parameters(), lr=1e-3)
+    # ★ EMA 초기화
+    ema = {k: v.detach().clone() for k, v in student.state_dict().items()}
+    def ema_update(mu: float = 0.999):
+        with torch.no_grad():
+            for k, v in student.state_dict().items():
+                ema[k].mul_(mu).add_(v.detach(), alpha=1 - mu)
+
     context_len = pred_len
     win_len = context_len + pred_len
     windows = [(s, s+win_len) for s in range(0, T - win_len + 1)]
     indices = np.arange(len(windows))
 
-    save_dir = args.save_dir or os.path.join("/root/Storage/hanyang_paper_study/Models/checkpoints", "student", ds_name)
+    save_dir = args.save_dir or os.path.join("/root/Storage/hanyang_paper_study/Models/checkpoints/v2", "student", ds_name)
     os.makedirs(save_dir, exist_ok=True)
     ckpt = os.path.join(save_dir, "student.pt")
 
@@ -170,63 +178,71 @@ def main():
             # ===교체====
             # 동일 x0_t, eps 사용
             # (1) 히든 상태
+            # ----- KD: 멀티-타임스텝 distillation -----
+            K = max(1, getattr(args, "kd_multi", 1))
+            kd_score = 0.0; kd_step = 0.0; kd_x0 = 0.0; kd_h = 0.0
+
+            # teacher/student 컨텍스트 hidden (한 번만)
             h0_t = torch.zeros(teacher.rnn.num_layers, B, teacher.hdim, device=dev)
             _, (hT, _) = teacher.rnn(x_ctx, (h0_t, torch.zeros_like(h0_t)))
             h_prev_t = hT[-1]
+
             h0_s = torch.zeros(student.rnn.num_layers, B, student.hdim, device=dev)
             _, (hS, _) = student.rnn(x_ctx, (h0_s, torch.zeros_like(h0_s)))
             h_prev_s = hS[-1]
 
-            # (2) t 선택: 전 시점 중 하나를 통일(배치 동일)
-            t_pick = torch.randint(low=0, high=P, size=(1,), device=dev).item()
-            x0_true = x_fut[:, t_pick]  # (B,D)
+            for _ in range(K):
+                t_pick = torch.randint(low=0, high=P, size=(1,), device=dev).item()
+                x0_true = x_fut[:, t_pick]
 
-            # (3) 노이즈, 스텝 매핑
-            n_s = torch.randint(low=1, high=N_s+1, size=(1,), device=dev).item()
-            n_t = int(np.ceil(n_s * N_t / N_s))
-            eps = torch.randn_like(x0_true)
+                n_s = torch.randint(low=1, high=N_s+1, size=(1,), device=dev).item()
+                n_t = int(np.ceil(n_s * N_t / N_s))
+                eps = torch.randn_like(x0_true)
 
-            teacher.sched.to(dev); student.sched.to(dev)
-            x_n_t = teacher.sched.sample_noisy(x0_true, torch.full((B,), n_t, device=dev, dtype=torch.long), eps)
-            x_n_s = student.sched.sample_noisy(x0_true, torch.full((B,), n_s, device=dev, dtype=torch.long), eps)
+                teacher.sched.to(dev); student.sched.to(dev)
+                x_n_t = teacher.sched.sample_noisy(x0_true, torch.full((B,), n_t, device=dev, dtype=torch.long), eps)
+                x_n_s = student.sched.sample_noisy(x0_true, torch.full((B,), n_s, device=dev, dtype=torch.long), eps)
 
-            # (4) score-KD
-            n_emb_t = teacher.noise_emb(torch.full((B,), n_t, device=dev, dtype=torch.long))
-            n_emb_s = student.noise_emb(torch.full((B,), n_s, device=dev, dtype=torch.long))
-            with torch.no_grad():
-                eps_t = teacher.eps_net(x_n_t, h_prev_t, n_emb_t)
-            eps_s = student.eps_net(x_n_s, h_prev_s, n_emb_s)
-            loss_kd_score = score_matching_kd(eps_s, eps_t, weight=1.0)
+                n_emb_t = teacher.noise_emb(torch.full((B,), n_t, device=dev, dtype=torch.long))
+                n_emb_s = student.noise_emb(torch.full((B,), n_s, device=dev, dtype=torch.long))
+                with torch.no_grad():
+                    eps_t = teacher.eps_net(x_n_t, h_prev_t, n_emb_t)
+                eps_s = student.eps_net(x_n_s, h_prev_s, n_emb_s)
 
-            # (5) 1-step update KD (각자 스케줄에서 n→n-1)
-            z = torch.randn_like(x_n_t)
-            with torch.no_grad():
-                xn1_t = teacher.sched.ddpm_step(x_n_t, eps_t, n_t, z)
-            xn1_s = student.sched.ddpm_step(x_n_s, eps_s, n_s, z)
-            loss_kd_step = one_step_update_kd(xn1_s, xn1_t, weight=1.0)
+                # score-KD
+                kd_score = kd_score + F.mse_loss(eps_s, eps_t)
 
-            # (6) x0-KD (trajectory KD의 간이형)  — 선택 가중치 gamma_x0
-            # x0_hat = (x_n - sqrt(1 - alpha_bar_n)*eps_hat) / sqrt(alpha_bar_n)
-            ab_t = teacher.sched.alpha_bar[n_t-1].to(dev)   # scalar tensor
-            ab_s = student.sched.alpha_bar[n_s-1].to(dev)
-            sqrt_ab_t = torch.sqrt(ab_t)
-            sqrt_ab_s = torch.sqrt(ab_s)
-            sqrt_1mab_t = torch.sqrt(1 - ab_t)
-            sqrt_1mab_s = torch.sqrt(1 - ab_s)
+                # 1-step KD
+                z = torch.randn_like(x_n_t)
+                with torch.no_grad():
+                    xn1_t = teacher.sched.ddpm_step(x_n_t, eps_t, n_t, z)
+                xn1_s = student.sched.ddpm_step(x_n_s, eps_s, n_s, z)
+                kd_step  = kd_step  + F.mse_loss(xn1_s, xn1_t)
 
-            with torch.no_grad():
-                x0_hat_t = (x_n_t - sqrt_1mab_t * eps_t) / sqrt_ab_t
-            x0_hat_s = (x_n_s - sqrt_1mab_s * eps_s) / sqrt_ab_s
-            loss_kd_x0 = torch.nn.functional.mse_loss(x0_hat_s, x0_hat_t)
+                # x0-KD
+                ab_t = teacher.sched.alpha_bar[n_t-1].to(dev); ab_s = student.sched.alpha_bar[n_s-1].to(dev)
+                sqrt_ab_t, sqrt_ab_s = torch.sqrt(ab_t), torch.sqrt(ab_s)
+                sqrt_1mab_t, sqrt_1mab_s = torch.sqrt(1 - ab_t), torch.sqrt(1 - ab_s)
+                with torch.no_grad():
+                    x0_hat_t = (x_n_t - sqrt_1mab_t * eps_t) / sqrt_ab_t
+                x0_hat_s = (x_n_s - sqrt_1mab_s * eps_s) / sqrt_ab_s
+                kd_x0 = kd_x0 + F.mse_loss(x0_hat_s, x0_hat_t)
+                kd_h = 0.0
+                # hidden-KD (컨텍스트 표현 정렬)
+                # kd_h = kd_h + F.mse_loss(h_prev_s, h_prev_t)
 
-            # ----- total loss (웜업 + 가중치) -----
+            # 평균
+            kd_score /= K; kd_step /= K; kd_x0 /= K; kd_h /= K
+
+            # ----- total loss (warm-up + weights) -----
             use_kd = (epoch > args.kd_warmup)
             if use_kd:
-                kd_term = args.lambda_kd * loss_kd_score + args.mu_kd * loss_kd_step + args.gamma_x0 * loss_kd_x0
+                kd_term = args.lambda_kd * kd_score + args.mu_kd * kd_step + args.gamma_x0 * kd_x0 + 0.05 * kd_h
             else:
                 kd_term = torch.zeros((), device=dev)
 
             loss = loss_data + kd_term
+
 
             opt.zero_grad()
             loss.backward()
@@ -234,34 +250,32 @@ def main():
                 torch.nn.utils.clip_grad_norm_(student.parameters(), args.grad_clip)
             opt.step()
 
-            # 로깅(한 배치 샘플의 분해 값)
-            losses.append(loss.item())
-            if (i == 0):  # 에폭마다 대표값 한 번만 찍고 싶으면 조건 유지/수정
-                print(f"[{ds_name}] Epoch {epoch:03d} | total={np.mean(losses):.6f} "
-                    f"| data={float(loss_data):.4f} "
-                    f"| kd_s={float(loss_kd_score):.4f} kd_step={float(loss_kd_step):.4f} kd_x0={float(loss_kd_x0):.4f} "
-                    f"| use_kd={use_kd}")
+            ema_update(mu=0.999)  # ★ EMA 갱신
 
+            losses.append(loss.item())
+            if (i == 0):
+                print(
+                    f"[{ds_name}] Epoch {epoch:03d} | total={np.mean(losses):.6f} "
+                    f"| data={float(loss_data):.4f} "
+                    f"| kd_s={float(kd_score):.4f} kd_step={float(kd_step):.4f} kd_x0={float(kd_x0):.4f} kd_h={float(kd_h):.4f} "
+                    f"| use_kd={use_kd}"
+                )
         print(f"[{ds_name}] Epoch {epoch:03d} | loss={np.mean(losses):.6f}")
         # torch.save({"model": student.state_dict(), "D": D}, ckpt)
-        cpu_state = {k: v.detach().cpu() for k, v in student.state_dict().items()}
+        cpu_ema = {k: v.cpu() for k, v in ema.items()}
         stu_cfg = {
-            "lstm_hidden": 24,
-            "lstm_layers": 2,
-            "noise_emb_dim": 32,
-            "residual_channels": student.eps_net.blocks[0].conv_f.out_channels,  # ex) 6
-            "residual_blocks": len(student.eps_net.blocks),                       # ex) 6
-            "n_diffusion_steps": student.sched.n,                                 # ex) 20
-            "beta_start": 1e-4,
-            "beta_end":  1e-1,
-            # KD/훈련 관련(있으면 기록) — 옵션을 이미 args로 쓰고 있다면 함께 기록
+            "lstm_hidden": 24, "lstm_layers": 2, "noise_emb_dim": 32,
+            "residual_channels": int(student.eps_net.blocks[0].conv_f.out_channels),
+            "residual_blocks":  int(len(student.eps_net.blocks)),
+            "n_diffusion_steps": int(student.sched.n),
+            "beta_start": 1e-4, "beta_end": 1e-1,
             "lambda_kd": getattr(args, "lambda_kd", None),
-            "mu_kd": getattr(args, "mu_kd", None),
-            "gamma_x0": getattr(args, "gamma_x0", None),
+            "mu_kd":     getattr(args, "mu_kd", None),
+            "gamma_x0":  getattr(args, "gamma_x0", None),
             "kd_warmup": getattr(args, "kd_warmup", None),
             "grad_clip": getattr(args, "grad_clip", None),
         }
-        torch.save({"model": cpu_state, "D": D, "cfg": stu_cfg, "role": "student"}, ckpt)
+        torch.save({"model": cpu_ema, "D": D, "cfg": stu_cfg, "role": "student"}, ckpt)
 
     print("Student saved:", ckpt)
 

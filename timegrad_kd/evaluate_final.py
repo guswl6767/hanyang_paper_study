@@ -1,196 +1,7 @@
-# # evaluate.py
-# import argparse, time, json
-# import numpy as np
-# import torch
-# from typing import Dict, List, Tuple
-# from configs import DATASETS
-# from data import load_multivariate, scale_by_context_mean
-# from model_timegrad import TimeGrad
-# from metrics import crps_sum_over_horizon
-
-# def count_params(m): return sum(p.numel() for p in m.parameters())
-
-# @torch.no_grad()
-# def _build_model_from_ckpt(state: Dict, D_infer: int, device: str):
-#     D_model = int(state.get("D", D_infer))
-#     if "cfg" in state:  # teacher
-#         cfg = state["cfg"]
-#         model = TimeGrad(
-#             D=D_model,
-#             lstm_hidden=cfg["lstm_hidden"], lstm_layers=cfg["lstm_layers"],
-#             noise_emb_dim=cfg["noise_emb_dim"],
-#             residual_channels=cfg["residual_channels"], residual_blocks=cfg["residual_blocks"],
-#             n_steps=cfg["n_diffusion_steps"], beta_start=cfg["beta_start"], beta_end=cfg["beta_end"]
-#         ).to(device)
-#     else:  # student
-#         model = TimeGrad(
-#             D=D_model, lstm_hidden=24, lstm_layers=2,
-#             noise_emb_dim=32, residual_channels=4, residual_blocks=4,
-#             n_steps=10, beta_start=1e-4, beta_end=1e-1
-#         ).to(device)
-#     model.load_state_dict(state["model"])
-#     model.eval()
-#     return model, D_model
-
-# def _force_2d(a: np.ndarray) -> np.ndarray:
-#     arr = np.asarray(a)
-#     if arr.ndim != 2:
-#         raise ValueError(f"target must be 2D, got shape={arr.shape}")
-#     return arr
-
-# def _orient_to_DT(arr: np.ndarray, D_model: int) -> np.ndarray:
-#     """(D,T) 또는 (T,D*k) 등 무엇이 와도 (D*k, T)로 맞춤."""
-#     arr = _force_2d(arr)
-#     r, c = arr.shape
-#     # 이미 (D*k, T)?
-#     if r % D_model == 0 and r >= D_model:
-#         return arr  # (D*k, T)
-#     # (T, D*k)?
-#     if c % D_model == 0 and c >= D_model:
-#         return arr.T  # -> (D*k, T)
-#     # (D, T)도 아니고 (T, D)도 아니면 실패
-#     raise ValueError(f"target shape {arr.shape} incompatible with model D={D_model}")
-
-# def _iter_ctx_fut_slices(target: np.ndarray, D_model: int, context_len: int, pred_len: int):
-#     """
-#     target: 어떤 형태든 (D*k, T)로 정규화한 뒤,
-#     - k=1이면 단일 윈도우
-#     - k>1이면 '차원에 합쳐진 여러 윈도우'를 k개로 분해하여 각각 (ctx,fut) 생성
-#     반환: List[(ctx(D,C), fut(D,P))]
-#     """
-#     DT = _orient_to_DT(target, D_model)          # (D*k, T)
-#     Dk, T = DT.shape
-#     if T < context_len + pred_len:
-#         return []
-#     k = Dk // D_model
-#     out = []
-#     for i in range(k):
-#         sl = DT[i*D_model:(i+1)*D_model, :]      # (D, T)
-#         # 길이가 조금씩 다른 케이스 대비: 가장 마지막 길이에 맞춰 꼬리 기준으로 슬라이스
-#         C, P = context_len, pred_len
-#         ctx = sl[:, T-(C+P):T-P]
-#         fut = sl[:, T-P:T]
-#         out.append((ctx.astype(np.float32), fut.astype(np.float32)))
-#     return out
-
-# def _ctx_to_tensor(ctx_np: np.ndarray, D_model: int, device: str) -> torch.Tensor:
-#     if ctx_np.shape[0] != D_model:
-#         raise ValueError(f"ctx first dim must be D={D_model}, got {ctx_np.shape}")
-#     return torch.tensor(ctx_np.T, device=device).unsqueeze(0)  # (1,C,D)
-
-# @torch.no_grad()
-# def run_eval(ckpt_path: str, dataset: str, device: str="cuda", num_samples: int=100):
-#     freq, pred_len = DATASETS[dataset]
-#     train_mv, test_mv, meta = load_multivariate(dataset)
-
-#     item0 = next(iter(train_mv))
-#     D_infer = int(item0["target"].shape[0])
-
-#     # state = torch.load(ckpt_path, map_location=device)
-#     state = torch.load(ckpt_path, map_location="cpu")
-
-#     model, D_model = _build_model_from_ckpt(state, D_infer, device)
-#     print(f"[EVAL] model device: {next(model.parameters()).device}", flush=True)  # => cuda:0 이어야 정상
-
-#     context_len = pred_len  # 논문: context = pred
-
-#     item = next(iter(test_mv))
-#     pairs = _iter_ctx_fut_slices(item["target"], D_model, context_len, pred_len)
-#     if not pairs:
-#         raise RuntimeError("No valid window in this test item.")
-#     # 단일 평가에선 '마지막' 슬라이스 하나만 사용
-#     ctx, fut = pairs[-1]
-#     ctx_s, fut_s, mean = scale_by_context_mean(ctx, fut)
-#     x_ctx = _ctx_to_tensor(ctx_s, D_model, device)
-
-#     t0 = time.time()
-#     samples = model.forecast(x_ctx, pred_len, num_samples=num_samples)[0]
-#     infer_time = time.time() - t0
-
-#     scale = torch.tensor(mean.T, device=device)
-#     samples = samples * scale
-#     crps = crps_sum_over_horizon(samples, torch.tensor(fut.T, device=device))
-
-#     return {
-#         "params": count_params(model),
-#         "infer_time_sec_mean": float(infer_time),
-#         "infer_time_windows": 1,
-#         "crps_sum_mean": float(crps),
-#         "crps_sum_std": 0.0,
-#         "windows": 1,
-#     }
-
-# @torch.no_grad()
-# def run_eval_rolling(ckpt_path: str, dataset: str, device: str="cuda", num_samples: int=100, max_windows: int=None):
-#     freq, pred_len = DATASETS[dataset]
-#     train_mv, test_mv, meta = load_multivariate(dataset)
-
-#     item0 = next(iter(train_mv))
-#     D_infer = int(item0["target"].shape[0])
-
-#     state = torch.load(ckpt_path, map_location=device)
-#     model, D_model = _build_model_from_ckpt(state, D_infer, device)
-#     params = count_params(model)
-#     context_len = pred_len
-
-#     crps_list: List[float] = []
-#     times: List[float] = []
-#     n_windows = 0
-
-#     for k, item in enumerate(test_mv):
-#         pairs = _iter_ctx_fut_slices(item["target"], D_model, context_len, pred_len)
-#         for (ctx, fut) in pairs:
-#             if (max_windows is not None) and (n_windows >= max_windows):
-#                 break
-#             ctx_s, fut_s, mean = scale_by_context_mean(ctx, fut)
-#             x_ctx = _ctx_to_tensor(ctx_s, D_model, device)
-
-#             t0 = time.time()
-#             samples = model.forecast(x_ctx, pred_len, num_samples=num_samples)[0]
-#             t1 = time.time()
-
-#             scale = torch.tensor(mean.T, device=device)
-#             samples = samples * scale
-#             crps = crps_sum_over_horizon(samples, torch.tensor(fut.T, device=device))
-
-#             crps_list.append(float(crps))
-#             times.append(float(t1 - t0))
-#             n_windows += 1
-#         if (max_windows is not None) and (n_windows >= max_windows):
-#             break
-
-#     if n_windows == 0:
-#         raise RuntimeError("No valid rolling windows found in test set.")
-
-#     return {
-#         "params": params,
-#         "infer_time_sec_mean": float(np.mean(times)),
-#         "infer_time_sec_std": float(np.std(times)),
-#         "infer_time_windows": n_windows,
-#         "crps_sum_mean": float(np.mean(crps_list)),
-#         "crps_sum_std": float(np.std(crps_list)),
-#         "windows": n_windows,
-#     }
-
-# if __name__ == "__main__":
-#     ap = argparse.ArgumentParser()
-#     ap.add_argument("--dataset", required=True, choices=list(DATASETS.keys()))
-#     ap.add_argument("--ckpt", required=True)
-#     ap.add_argument("--device", default="cuda")
-#     ap.add_argument("--rolling", action="store_true")
-#     ap.add_argument("--num_samples", type=int, default=100)
-#     ap.add_argument("--max_windows", type=int, default=None)
-#     args = ap.parse_args()
-
-#     if args.rolling:
-#         out = run_eval_rolling(args.ckpt, args.dataset, args.device, num_samples=args.num_samples, max_windows=args.max_windows)
-#     else:
-#         out = run_eval(args.ckpt, args.dataset, args.device, num_samples=args.num_samples)
-
-#     print(json.dumps(out, indent=2, ensure_ascii=False))
-
 # evaluate.py
 import argparse, time, json
+import os, platform, datetime
+
 import numpy as np
 import torch
 from typing import Dict, List, Tuple
@@ -200,6 +11,23 @@ from model_timegrad import TimeGrad
 from metrics import crps_sum_over_horizon,crps_mean_over_horizon
 
 
+def _env_info(device: str):
+    info = {
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "cuda_available": torch.cuda.is_available(),
+        "cudnn_enabled": torch.backends.cudnn.enabled,
+        "cudnn_deterministic": getattr(torch.backends.cudnn, "deterministic", None),
+        "device": device,
+    }
+    try:
+        if torch.cuda.is_available():
+            info["gpu_name"] = torch.cuda.get_device_name(0)
+            info["gpu_count"] = torch.cuda.device_count()
+            info["cuda_version"] = torch.version.cuda
+    except Exception:
+        pass
+    return info
 
 def count_params(m): return sum(p.numel() for p in m.parameters())
 @torch.no_grad()
@@ -335,6 +163,7 @@ def _count_total_windows(test_mv, D_model: int, context_len: int, pred_len: int)
 
 @torch.no_grad()
 def run_eval(ckpt_path: str, dataset: str, device: str="cuda", num_samples: int=100):
+    t_start = time.time()
     freq, pred_len = DATASETS[dataset]
     train_mv, test_mv, meta = load_multivariate(dataset)
 
@@ -372,13 +201,28 @@ def run_eval(ckpt_path: str, dataset: str, device: str="cuda", num_samples: int=
     model_cfg = state.get("cfg", {})
 
     print(f"[EVAL] CRPS_sum={crps:.6f} | CRPS_meanD={crps_meanD:.6f}", flush=True)
+    t_end = time.time()
+    env = _env_info(device)
+    source_ckpt = os.path.abspath(ckpt_path)
     return {
         "dataset": dataset,
         "D": D_model,
         "pred_len": pred_len,
+        "freq": DATASETS[dataset][0],           # 빈도도 같이
         "model_role": model_role,
         "model_cfg": model_cfg,                   # ★ 어떤 파라미터로 모델이 만들어졌는지
-        "eval_cfg": {"num_samples": num_samples},
+        "eval_cfg": {
+            "num_samples": num_samples,
+            "batch_windows": 1,                 # 단일 윈도우 평가
+            "max_windows": None,
+            "skip_windows": 0,
+            "seed": None,                       # 단일 평가 경로엔 args 접근이 어려우면 None로
+            "start_ts": datetime.datetime.utcfromtimestamp(t_start).isoformat()+"Z",
+            "end_ts":   datetime.datetime.utcfromtimestamp(t_end).isoformat()+"Z",
+            "duration_sec": t_end - t_start,
+    },
+        "env": env,
+        "source_ckpt": source_ckpt,
         "params": count_params(model),
         "infer_time_sec_mean": float(infer_time),
         "infer_time_windows": 1,
@@ -392,6 +236,7 @@ def run_eval(ckpt_path: str, dataset: str, device: str="cuda", num_samples: int=
 def run_eval_rolling(ckpt_path: str, dataset: str, device: str="cuda",
                      num_samples: int=100, max_windows: int=None,
                      skip_windows: int=0, batch_windows: int=1):
+    t_start = time.time()
     freq, pred_len = DATASETS[dataset]
     train_mv, test_mv, meta = load_multivariate(dataset)
 
@@ -440,7 +285,8 @@ def run_eval_rolling(ckpt_path: str, dataset: str, device: str="cuda",
         t0 = time.time()
         samp = model.forecast(x_ctx, pred_len, num_samples=num_samples)  # (B,S,P,D)
         t1 = time.time()
-        times.extend([float(t1-t0)]*len(batch))
+        per_win = float(t1 - t0) / len(batch)     # 윈도우당 시간
+        times.extend([per_win] * len(batch))
 
         for b in range(len(batch)):
             scale = torch.tensor(means[b], device=device)  # (1,D)
@@ -475,13 +321,29 @@ def run_eval_rolling(ckpt_path: str, dataset: str, device: str="cuda",
       f"CRPS_meanD(mean±std)={crps_meanD_mean:.6f}±{crps_meanD_std:.6f}", flush=True)
     model_role = state.get("role", "teacher" if "cfg" in state else "student")
     model_cfg = state.get("cfg", {})
+    t_end = time.time()
+    env = _env_info(device)
+    source_ckpt = os.path.abspath(ckpt_path)
     return {
         "dataset": dataset,
         "D": D_model,
         "pred_len": pred_len,
+        "freq": DATASETS[dataset][0],
         "model_role": model_role,
         "model_cfg": model_cfg,                          # ★
-        "eval_cfg": {"num_samples": num_samples, "batch_windows": batch_windows},  # ★
+        "eval_cfg": {
+            "num_samples": num_samples,
+            "batch_windows": batch_windows,
+            "max_windows": max_windows,
+            "skip_windows": skip_windows,
+            "total_windows_all": total,              # 샤딩/절삭 전 전체 윈도우 수
+            "seed": getattr(args, "seed", None),     # main에서 전달된 seed
+            "start_ts": datetime.datetime.utcfromtimestamp(t_start).isoformat()+"Z",
+            "end_ts":   datetime.datetime.utcfromtimestamp(t_end).isoformat()+"Z",
+            "duration_sec": t_end - t_start,
+    },
+        "env": env,
+        "source_ckpt": source_ckpt,
         "params": params,
         "infer_time_sec_mean": float(np.mean(times)),
         "infer_time_sec_std": float(np.std(times)),
@@ -506,6 +368,7 @@ if __name__ == "__main__":
     ap.add_argument("--max_windows", type=int, default=None)
     ap.add_argument("--skip_windows", type=int, default=0, help="앞의 윈도우 N개 스킵(샤딩용)")
     ap.add_argument("--batch_windows", type=int, default=1, help="한 번에 처리할 윈도우 수(B)")
+    ap.add_argument("--save_json", default=None)
     args = ap.parse_args()
     _seed_all(args.seed)
     if args.rolling:
@@ -517,4 +380,6 @@ if __name__ == "__main__":
     else:
         out = run_eval(args.ckpt, args.dataset, args.device, num_samples=args.num_samples)
 
+    if args.save_json:
+        with open(args.save_json, "w") as f: json.dump(out, f, indent=2, ensure_ascii=False)
     print(json.dumps(out, ensure_ascii=False))

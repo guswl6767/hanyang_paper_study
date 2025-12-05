@@ -440,7 +440,8 @@ def run_eval_rolling(ckpt_path: str, dataset: str, device: str="cuda",
         t0 = time.time()
         samp = model.forecast(x_ctx, pred_len, num_samples=num_samples)  # (B,S,P,D)
         t1 = time.time()
-        times.extend([float(t1-t0)]*len(batch))
+        per_win = float(t1 - t0) / len(batch)     # 윈도우당 시간
+        times.extend([per_win] * len(batch))
 
         for b in range(len(batch)):
             scale = torch.tensor(means[b], device=device)  # (1,D)
@@ -506,6 +507,7 @@ if __name__ == "__main__":
     ap.add_argument("--max_windows", type=int, default=None)
     ap.add_argument("--skip_windows", type=int, default=0, help="앞의 윈도우 N개 스킵(샤딩용)")
     ap.add_argument("--batch_windows", type=int, default=1, help="한 번에 처리할 윈도우 수(B)")
+    ap.add_argument("--save_json", default=None)
     args = ap.parse_args()
     _seed_all(args.seed)
     if args.rolling:
@@ -517,4 +519,6 @@ if __name__ == "__main__":
     else:
         out = run_eval(args.ckpt, args.dataset, args.device, num_samples=args.num_samples)
 
+    if args.save_json:
+        with open(args.save_json, "w") as f: json.dump(out, f, indent=2, ensure_ascii=False)
     print(json.dumps(out, ensure_ascii=False))

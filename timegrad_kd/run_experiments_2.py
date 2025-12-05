@@ -230,7 +230,7 @@ def _extract_last_json_block(text: str) -> str:
 def eval_model(ckpt: str, dataset: str, device: str, num_samples: int,
                rolling: bool = True, max_windows: int = None, batch_windows: int = 1,
                gpu_id: str = None) -> Dict:
-    cmd = ["python", "evaluate.py", "--dataset", dataset, "--ckpt", ckpt,
+    cmd = ["python", "evaluate_2.py", "--dataset", dataset, "--ckpt", ckpt,
            "--device", device, "--num_samples", str(num_samples)]
     if rolling: cmd.append("--rolling")
     if max_windows is not None: cmd += ["--max_windows", str(max_windows)]
@@ -318,7 +318,7 @@ def main():
 
         if not args.skip_train and not args.skip_teacher_train:
             if not os.path.isfile(teacher_ckpt):
-                run_live(["python","train_teacher.py","--dataset",ds,
+                run_live(["python","train_teacher_2.py","--dataset",ds,
                         "--epochs",str(args.epochs_teacher),
                         "--device",args.device,"--save_dir",teacher_dir],
                         gpu_id=gpus[idx % len(gpus)])
@@ -329,7 +329,7 @@ def main():
 
         # STUDENT TRAIN (teacher_ckpt만 필요)
         if not args.skip_train:
-            run_live(["python","train_student.py","--dataset",ds,
+            run_live(["python","train_student_2.py","--dataset",ds,
                     "--epochs",str(args.epochs_student),
                     "--device",args.device,"--teacher_ckpt",teacher_ckpt,
                     "--save_dir",student_dir],
